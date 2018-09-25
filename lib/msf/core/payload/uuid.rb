@@ -42,7 +42,9 @@ class Msf::Payload::UUID
     23 => ARCH_ZARCH,
     24 => ARCH_AARCH64,
     25 => ARCH_MIPS64,
-    26 => ARCH_PPC64LE
+    26 => ARCH_PPC64LE,
+    27 => ARCH_R,
+    28 => ARCH_PPCE500V2
   }
 
   Platforms = {
@@ -69,7 +71,10 @@ class Msf::Payload::UUID
     20 => 'js',
     21 => 'python',
     22 => 'nodejs',
-    23 => 'firefox'
+    23 => 'firefox',
+    24 => 'r',
+    25 => 'apple_ios',
+    26 => 'juniper',
   }
 
   # The raw length of the UUID structure
@@ -94,8 +99,8 @@ class Msf::Payload::UUID
   # @option opts [String] :arch The hardware architecture for this payload
   # @option opts [String] :platform The operating system platform for this payload
   # @option opts [String] :timestamp The timestamp in UTC Unix epoch format
-  # @option opts [Fixnum] :xor1 An optional 8-bit XOR ID for obfuscation
-  # @option opts [Fixnum] :xor2 An optional 8-bit XOR ID for obfuscation
+  # @option opts [Integer] :xor1 An optional 8-bit XOR ID for obfuscation
+  # @option opts [Integer] :xor2 An optional 8-bit XOR ID for obfuscation
   # @return [String] The encoded payoad UUID as a binary string
   #
   def self.generate_raw(opts={})
@@ -108,7 +113,7 @@ class Msf::Payload::UUID
       puid = seed_to_puid(opts[:seed])
     end
 
-    puid ||= Rex::Text.rand_text(8)
+    puid ||= SecureRandom.random_bytes(8)
 
     if puid.length != 8
       raise ArgumentError, "The :puid parameter must be exactly 8 bytes"
@@ -195,7 +200,7 @@ class Msf::Payload::UUID
   # Look up the numeric platform ID given a string or PlatformList as input
   #
   # @param platform [String] The name of the platform to lookup
-  # @return [Fixnum] The integer value of this platform
+  # @return [Integer] The integer value of this platform
   #
   def self.find_platform_id(platform)
     # Handle a PlatformList input by grabbing the first entry
@@ -218,7 +223,7 @@ class Msf::Payload::UUID
   # Look up the numeric architecture ID given a string as input
   #
   # @param name [String] The name of the architecture to lookup
-  # @return [Fixnum] The integer value of this architecture
+  # @return [Integer] The integer value of this architecture
   #
   def self.find_architecture_id(name)
     name = name.first if name.kind_of? ::Array
@@ -251,12 +256,16 @@ class Msf::Payload::UUID
     self.xor1      = opts[:xor1]
     self.xor2      = opts[:xor2]
 
+    self.timestamp  = nil
+    self.name       = nil
+    self.registered = false
+
     if opts[:seed]
       self.puid = self.class.seed_to_puid(opts[:seed])
     end
 
     # Generate some sensible defaults
-    self.puid ||= Rex::Text.rand_text(8)
+    self.puid ||= SecureRandom.random_bytes(8)
     self.xor1 ||= rand(256)
     self.xor2 ||= rand(256)
     self.timestamp ||= Time.now.utc.to_i
@@ -363,6 +372,10 @@ class Msf::Payload::UUID
     self.xor1 = self.xor2 = nil
     self
   end
+
+  attr_accessor :registered
+  attr_accessor :timestamp
+  attr_accessor :name
 
   attr_reader :arch
   attr_reader :platform

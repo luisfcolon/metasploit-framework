@@ -13,21 +13,20 @@ module Msf
         class Modules
 
           include Msf::Ui::Console::CommandDispatcher
+          include Msf::Ui::Console::CommandDispatcher::Common
 
           # Constant for a retry timeout on using modules before they're loaded
           CMD_USE_TIMEOUT = 3
 
-          # Constant for disclosure date formatting in search functions
-          DISCLOSURE_DATE_FORMAT = "%Y-%m-%d"
-
           @@search_opts = Rex::Parser::Arguments.new(
-            "-h" => [ false, "Help banner."]
+            "-h"     => [ false, "Help banner"],
+            "-o"     => [ true, "Send output to a file in csv format"],
+            "-S"     => [ true, "Search string for row filter"],
           )
 
           def commands
             {
               "back"       => "Move back from the current context",
-              "edit"       => "Edit the current module with $VISUAL or $EDITOR",
               "advanced"   => "Displays advanced options for one or more modules",
               "info"       => "Displays information about one or more modules",
               "options"    => "Displays global options or for one or more modules",
@@ -49,9 +48,9 @@ module Msf
             super
 
             @dscache = {}
-            @cache_payloads = nil
             @previous_module = nil
             @module_name_stack = []
+            @dangerzone_map = nil
           end
 
           #
@@ -60,39 +59,6 @@ module Msf
           def name
             "Module"
           end
-
-
-          def local_editor
-            Rex::Compat.getenv('VISUAL') || Rex::Compat.getenv('EDITOR') || '/usr/bin/vim'
-          end
-
-          def cmd_edit_help
-            msg = "Edit the currently active module"
-            msg = "#{msg} #{local_editor ? "with #{local_editor}" : "($VISUAL or $EDITOR must be set first)"}."
-            print_line "Usage: edit"
-            print_line
-            print_line msg
-            print_line "When done editing, you must reload the module with 'reload' or 'rexploit'."
-            print_line
-          end
-
-          #
-          # Edit the currently active module
-          #
-          def cmd_edit
-            unless local_editor
-              print_error "$VISUAL or $EDITOR must be set first. Try 'export EDITOR=/usr/bin/vim'"
-              return
-            end
-            if active_module
-              path = active_module.file_path
-              print_status "Launching #{local_editor} #{path}"
-              system(local_editor,path)
-            else
-              print_error "Nothing to edit -- try using a module first."
-            end
-          end
-
 
           def cmd_advanced_help
             print_line 'Usage: advanced [mod1 mod2 ...]'
@@ -351,21 +317,38 @@ module Msf
           end
 
           def cmd_search_help
-            print_line "Usage: search [keywords]"
+            print_line "Usage: search [ options ] <keywords>"
+            print_line
+            print_line "OPTIONS:"
+            print_line "  -h                Show this help information"
+            print_line "  -o <file>         Send output to a file in csv format"
+            print_line "  -S <string>       Search string for row filter"
             print_line
             print_line "Keywords:"
             {
-              'app'      => 'Modules that are client or server attacks',
-              'author'   => 'Modules written by this author',
-              'bid'      => 'Modules with a matching Bugtraq ID',
-              'cve'      => 'Modules with a matching CVE ID',
-              'edb'      => 'Modules with a matching Exploit-DB ID',
-              'name'     => 'Modules with a matching descriptive name',
-              'platform' => 'Modules affecting this platform',
-              'ref'      => 'Modules with a matching ref',
-              'type'     => 'Modules of a specific type (exploit, auxiliary, or post)',
+              'aka'         => 'Modules with a matching AKA (also-known-as) name',
+              'app'         => 'Modules that are client or server attacks',
+              'author'      => 'Modules written by this author',
+              'arch'        => 'Modules affecting this architecture',
+              'bid'         => 'Modules with a matching Bugtraq ID',
+              'cve'         => 'Modules with a matching CVE ID',
+              'edb'         => 'Modules with a matching Exploit-DB ID',
+              'check'       => 'Modules that support the \'check\' method',
+              'date'        => 'Modules with a matching disclosure date',
+              'description' => 'Modules with a matching description',
+              'full_name'   => 'Modules with a matching full name',
+              'mod_time'    => 'Modules with a matching modification date',
+              'name'        => 'Modules with a matching descriptive name',
+              'path'        => 'Modules with a matching path',
+              'platform'    => 'Modules affecting this platform',
+              'port'        => 'Modules with a matching port',
+              'rank'        => 'Modules with a matching rank (Can be descriptive (ex: \'good\') or numeric with comparison operators (ex: \'gte400\'))',
+              'ref'         => 'Modules with a matching ref',
+              'reference'   => 'Modules with a matching reference',
+              'target'      => 'Modules affecting this target',
+              'type'        => 'Modules of a specific type (exploit, payload, auxiliary, encoder, post, or nop)',
             }.each_pair do |keyword, description|
-              print_line "  #{keyword.ljust 10}:  #{description}"
+              print_line "  #{keyword.ljust 12}:  #{description}"
             end
             print_line
             print_line "Examples:"
@@ -377,67 +360,98 @@ module Msf
           # Searches modules for specific keywords
           #
           def cmd_search(*args)
-            match   = ''
+            if args.empty?
+              print_error("Argument required\n")
+              cmd_search_help
+              return
+            end
+
+            match = ''
+            search_term = nil
+            output_file = nil
             @@search_opts.parse(args) { |opt, idx, val|
               case opt
-                when "-t"
-                  print_error("Deprecated option.  Use type:#{val} instead")
-                  cmd_search_help
-                  return
+                when "-S"
+                  search_term = val
                 when "-h"
                   cmd_search_help
                   return
+                when '-o'
+                  output_file = val
                 else
                   match += val + " "
               end
             }
 
-            if framework.db
-              if framework.db.migrated && framework.db.modules_cached
-                search_modules_sql(match)
-                return
-              else
-                print_warning("Module database cache not built yet, using slow search")
+            if match.empty? && search_term.nil?
+              print_error("Keywords or search argument required\n")
+              cmd_search_help
+              return
+            end
+
+            # Display the table of matches
+            tbl = generate_module_table("Matching Modules", search_term)
+            search_params = parse_search_string(match)
+            begin
+              Msf::Modules::Metadata::Cache.instance.find(search_params).each do |m|
+                tbl << [
+                    m.full_name,
+                    m.disclosure_date.nil? ? '' : m.disclosure_date.strftime("%Y-%m-%d"),
+                    RankingName[m.rank].to_s,
+                    m.check ? 'Yes' : 'No',
+                    m.name
+                ]
               end
+            rescue ArgumentError
+              print_error("Invalid argument(s)\n")
+              cmd_search_help
+            end
+
+            if output_file
+              print_status("Wrote search results to #{output_file}")
+              ::File.open(output_file, "wb") { |ofd|
+                ofd.write(tbl.to_csv)
+              }
             else
-              print_warning("Database not connected, using slow search")
+              print_line(tbl.to_s)
             end
+          end
 
-            tbl = generate_module_table("Matching Modules")
-            [
-              framework.exploits,
-              framework.auxiliary,
-              framework.post,
-              framework.payloads,
-              framework.nops,
-              framework.encoders
-            ].each do |mset|
-              mset.each do |m|
-                o = mset.create(m[0]) rescue nil
+          #
+          # Parses command line search string into a hash
+          #
+          # Resulting Hash Example:
+          # {"platform"=>[["android"], []]} will match modules targeting the android platform
+          # {"platform"=>[[], ["android"]]} will exclude modules targeting the android platform
+          #
+          def parse_search_string(search_string)
+            # Split search terms by space, but allow quoted strings
+            terms = search_string.split(/\"/).collect{|term| term.strip==term ? term : term.split(' ')}.flatten
+            terms.delete('')
 
-                # Expected if modules are loaded without the right pre-requirements
-                next if not o
+            # All terms are either included or excluded
+            res = {}
 
-                if not o.search_filter(match)
-                  tbl << [ o.fullname, o.disclosure_date.nil? ? "" : o.disclosure_date.strftime(DISCLOSURE_DATE_FORMAT), o.rank_to_s, o.name ]
-                end
+            terms.each do |term|
+              keyword, search_term = term.split(":", 2)
+              unless search_term
+                search_term = keyword
+                keyword = 'text'
+              end
+              next if search_term.length == 0
+              keyword.downcase!
+              search_term.downcase!
+              res[keyword] ||=[   [],    []   ]
+              if search_term[0,1] == "-"
+                next if search_term.length == 1
+                res[keyword][1] << search_term[1,search_term.length-1]
+              else
+                res[keyword][0] << search_term
               end
             end
-            print_line(tbl.to_s)
-
+            res
           end
 
-          # Prints table of modules matching the search_string.
-          #
-          # @param (see Msf::DBManager#search_modules)
-          # @return [void]
-          def search_modules_sql(search_string)
-            tbl = generate_module_table("Matching Modules")
-            framework.db.search_modules(search_string).each do |o|
-              tbl << [ o.fullname, o.disclosure_date.nil? ? "" : o.disclosure_date.strftime(DISCLOSURE_DATE_FORMAT), RankingName[o.rank].to_s, o.name ]
-            end
-            print_line(tbl.to_s)
-          end
 
           #
           # Tab completion for the search command
@@ -451,18 +465,11 @@ module Msf
               return @@search_opts.fmt.keys
             end
 
-            case (words[-1])
-              when "-r"
-                return RankingName.sort.map{|r| r[1]}
-              when "-t"
-                return %w{auxiliary encoder exploit nop payload post}
-            end
-
             []
           end
 
           def cmd_show_help
-            global_opts = %w{all encoders nops exploits payloads auxiliary plugins info options}
+            global_opts = %w{all encoders nops exploits payloads auxiliary post plugins info options}
             print_status("Valid parameters for the \"show\" command are: #{global_opts.join(", ")}")
 
             module_opts = %w{ missing advanced evasion targets actions }
@@ -474,9 +481,13 @@ module Msf
           # no type is provided.
           #
           def cmd_show(*args)
+            if args.empty?
+              print_error("Argument required\n")
+              cmd_show_help
+              return
+            end
+            
             mod = self.active_module
-
-            args << "all" if (args.length == 0)
 
             args.each { |type|
               case type
@@ -570,7 +581,7 @@ module Msf
 
             res = %w{all encoders nops exploits payloads auxiliary post plugins options}
             if (active_module)
-              res.concat(%w{ missing advanced evasion targets actions })
+              res.concat %w{missing advanced evasion targets actions info}
               if (active_module.respond_to? :compatible_sessions)
                 res << "sessions"
               end
@@ -589,13 +600,24 @@ module Msf
           # Uses a module.
           #
           def cmd_use(*args)
-            if (args.length == 0)
+            if args.length == 0 || args.first == '-h'
               cmd_use_help
               return false
             end
 
+            # Divert logic for dangerzone mode
+            args = dangerzone_codename_to_module(args)
+
             # Try to create an instance of the supplied module name
             mod_name = args[0]
+
+            # Ensure we have a reference name and not a path
+            if mod_name.start_with?('./', 'modules/')
+              mod_name.sub!(%r{^(?:\./)?modules/}, '')
+            end
+            if mod_name.end_with?('.rb')
+              mod_name.sub!(/\.rb$/, '')
+            end
 
             begin
               mod = framework.modules.create(mod_name)
@@ -655,19 +677,13 @@ module Msf
               active_module.datastore.update(@dscache[active_module.fullname])
             end
 
-            @cache_payloads = nil
             mod.init_ui(driver.input, driver.output)
-
-            # Update the command prompt
-            prompt = framework.datastore['Prompt'] || Msf::Ui::Console::Driver::DefaultPrompt
-            prompt_char = framework.datastore['PromptChar'] || Msf::Ui::Console::Driver::DefaultPromptChar
-            driver.update_prompt("#{prompt} #{mod.type}(%bld%red#{mod.shortname}%clr) ", prompt_char, true)
           end
 
           #
           # Command to take to the previously active module
           #
-          def cmd_previous()
+          def cmd_previous(*args)
             if @previous_module
               self.cmd_use(@previous_module.fullname)
             else
@@ -844,11 +860,6 @@ module Msf
 
               # Destack the current dispatcher
               driver.destack_dispatcher
-
-              # Restore the prompt
-              prompt = framework.datastore['Prompt'] || Msf::Ui::Console::Driver::DefaultPrompt
-              prompt_char = framework.datastore['PromptChar'] || Msf::Ui::Console::Driver::DefaultPromptChar
-              driver.update_prompt("#{prompt} ", prompt_char, true)
             end
           end
 
@@ -864,7 +875,84 @@ module Msf
               end
             end
 
+            return dangerzone_modules_to_codenames(res.sort) if dangerzone_active?
             return res.sort
+          end
+
+          #
+          # Convert squirrel names back to regular module names
+          #
+          def dangerzone_codename_to_module(args)
+            return args unless dangerzone_active? && args.length > 0 && args[0].length > 0
+            return args unless args[0] =~ /^[A-Z]/
+            args[0] = dangerzone_codename_to_module_name(args[0])
+            args
+          end
+
+          #
+          # Determine if dangerzone mode is active via date or environment variable
+          #
+          def dangerzone_active?
+            active = Time.now.strftime("%m%d") == "0401" || Rex::Compat.getenv('DANGERZONE').to_i > 0
+            if active && @dangerzone_map.nil?
+              dangerzone_build_map
+            end
+            active
+          end
+
+          #
+          # Convert module names to squirrel names
+          #
+          def dangerzone_modules_to_codenames(names)
+            (names + @dangerzone_map.keys.grep(/^[A-Z]+/)).sort
+          end
+
+          def dangerzone_codename_to_module_name(cname)
+            @dangerzone_map[cname] || cname
+          end
+
+          def dangerzone_module_name_to_codename(mname)
+            @dangerzone_map[mname] || mname
+          end
+
+          def dangerzone_build_map
+            return unless @dangerzone_map.nil?
+
+            @dangerzone_map = {}
+
+            res = []
+            %W{exploit auxiliary}.each do |mtyp|
+              mset = framework.modules.module_names(mtyp)
+              mset.each do |mref|
+                res << mtyp + '/' + mref
+              end
+            end
+
+            words_a = ::File.readlines(::File.join(
+              ::Msf::Config.data_directory, "wordlists", "dangerzone_a.txt"
+              )).map{|line| line.strip.upcase}
+
+            words_b = ::File.readlines(::File.join(
+              ::Msf::Config.data_directory, "wordlists", "dangerzone_b.txt"
+              )).map{|line| line.strip.upcase}
+
+            aidx = -1
+            bidx = -1
+
+            res.sort.each do |mname|
+              word_a = words_a[ (aidx += 1) % words_a.length ]
+              word_b = words_b[ (bidx += 1) % words_b.length ]
+              cname = word_a + word_b
+
+              while @dangerzone_map[cname]
+                aidx += 1
+                word_a = words_a[ (aidx += 1) % words_a.length ]
+                cname = word_a + word_b
+              end
+
+              @dangerzone_map[mname] = cname
+              @dangerzone_map[cname] = mname
+            end
           end
 
           #
@@ -905,44 +993,6 @@ module Msf
 
           def show_post(regex = nil, minrank = nil, opts = nil) # :nodoc:
             show_module_set("Post", framework.post, regex, minrank, opts)
-          end
-
-          def show_options(mod) # :nodoc:
-            mod_opt = Serializer::ReadableText.dump_options(mod, '   ')
-            print("\nModule options (#{mod.fullname}):\n\n#{mod_opt}\n") if (mod_opt and mod_opt.length > 0)
-
-            # If it's an exploit and a payload is defined, create it and
-            # display the payload's options
-            if (mod.exploit? and mod.datastore['PAYLOAD'])
-              p = framework.payloads.create(mod.datastore['PAYLOAD'])
-
-              if (!p)
-                print_error("Invalid payload defined: #{mod.datastore['PAYLOAD']}\n")
-                return
-              end
-
-              p.share_datastore(mod.datastore)
-
-              if (p)
-                p_opt = Serializer::ReadableText.dump_options(p, '   ')
-                print("\nPayload options (#{mod.datastore['PAYLOAD']}):\n\n#{p_opt}\n") if (p_opt and p_opt.length > 0)
-              end
-            end
-
-            # Print the selected target
-            if (mod.exploit? and mod.target)
-              mod_targ = Serializer::ReadableText.dump_exploit_target(mod, '   ')
-              print("\nExploit target:\n\n#{mod_targ}\n") if (mod_targ and mod_targ.length > 0)
-            end
-
-            # Print the selected action
-            if mod.kind_of?(Msf::Module::HasActions) && mod.action
-              mod_action = Serializer::ReadableText.dump_module_action(mod, '   ')
-              print("\n#{mod.type.capitalize} action:\n\n#{mod_action}\n") if (mod_action and mod_action.length > 0)
-            end
-
-            # Uncomment this line if u want target like msf2 format
-            #print("\nTarget: #{mod.target.name}\n\n")
           end
 
           def show_missing(mod) # :nodoc:
@@ -1095,7 +1145,13 @@ module Msf
                     end
                   end
                   if (opts == nil or show == true)
-                    tbl << [ refname, o.disclosure_date.nil? ? "" : o.disclosure_date.strftime(DISCLOSURE_DATE_FORMAT), o.rank_to_s, o.name ]
+                    tbl << [
+                      refname,
+                      o.disclosure_date.nil? ? "" : o.disclosure_date.strftime("%Y-%m-%d"),
+                      o.rank_to_s,
+                      o.respond_to?(:check) ? 'Yes' : 'No',
+                      o.name
+                    ]
                   end
                 end
               end
@@ -1104,13 +1160,14 @@ module Msf
             print(tbl.to_s)
           end
 
-          def generate_module_table(type) # :nodoc:
+          def generate_module_table(type, search_term = nil) # :nodoc:
             Table.new(
               Table::Style::Default,
-              'Header'  => type,
-              'Prefix'  => "\n",
-              'Postfix' => "\n",
-              'Columns' => [ 'Name', 'Disclosure Date', 'Rank', 'Description' ]
+              'Header'     => type,
+              'Prefix'     => "\n",
+              'Postfix'    => "\n",
+              'Columns'    => [ 'Name', 'Disclosure Date', 'Rank', 'Check', 'Description' ],
+              'SearchTerm' => search_term
             )
           end
 

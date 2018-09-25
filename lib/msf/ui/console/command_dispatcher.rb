@@ -1,5 +1,5 @@
 # -*- coding: binary -*-
-
+require 'msf/ui/console/command_dispatcher/common'
 module Msf
 module Ui
 module Console
@@ -88,6 +88,7 @@ module CommandDispatcher
         return if ele.count('-') > 1
         return if ele.first == '-' || ele[-1] == '-'
         return if ele.first == '.' || ele[-1] == '.'
+        return unless ele =~ (/^(\d)+$/)  # Not a number
 
         if ele.include? '-'
           temp_array = (ele.split("-").inject { |s, e| s.to_i..e.to_i }).to_a

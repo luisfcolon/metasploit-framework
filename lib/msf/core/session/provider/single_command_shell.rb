@@ -43,7 +43,9 @@ module SingleCommandShell
   # Read data until we find the token
   #
   def shell_read_until_token(token, wanted_idx=0, timeout=10)
-    if (wanted_idx == 0)
+    return if timeout.to_i == 0
+
+    if wanted_idx == 0
       parts_needed = 2
     else
       parts_needed = 1 + (wanted_idx * 2)
@@ -55,12 +57,13 @@ module SingleCommandShell
         buf = ''
         idx = nil
         loop do
-          if (tmp = shell_read(-1, 2))
+          if (tmp = shell_read(-1))
             buf << tmp
 
             # see if we have the wanted idx
             parts = buf.split(token, -1)
-            if (parts.length == parts_needed)
+
+            if parts.length == parts_needed
               # cause another prompt to appear (just in case)
               shell_write("\n")
               return parts[wanted_idx]
